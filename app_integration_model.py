@@ -301,16 +301,62 @@ try:
         force_lambda_one=force_lambda_one,
     )
 except TypeError:
-    results = model.run_simulation(
-        CP=CP,
-        use_EC=use_EC,
-        theta_mode=theta_mode_internal,
+  # ===============================================================
+# RUN SIMULATION (robust to different model signatures)
+# ===============================================================
+
+def run_model(CP, use_EC, theta_mode, voting_rule, force_lambda_one):
+    # 1) Keyword-style signature (your old Streamlit-style model)
+    try:
+        return model.run_simulation(
+            CP=CP,
+            use_EC=use_EC,
+            theta_mode=theta_mode,
+            voting_rule=voting_rule,
+            force_lambda_one=force_lambda_one,
+        )
+    except TypeError:
+        pass
+
+    # 2) Same, without force_lambda_one
+    try:
+        return model.run_simulation(
+            CP=CP,
+            use_EC=use_EC,
+            theta_mode=theta_mode,
+            voting_rule=voting_rule,
+        )
+    except TypeError:
+        pass
+
+    # 3) Positional-CP signature (some versions use run_simulation(CP, voting_rule=...))
+    try:
+        return model.run_simulation(
+            CP,
+            voting_rule=voting_rule,
+            force_lambda_one=force_lambda_one,
+        )
+    except TypeError:
+        pass
+
+    # 4) Positional-CP without force_lambda_one
+    return model.run_simulation(
+        CP,
         voting_rule=voting_rule,
     )
-    # best-effort display override if model doesn't support it internally
-    if force_lambda_one and ("lambda" in results):
-        results["lambda"] = np.ones_like(np.asarray(results["lambda"]), dtype=float)
 
+
+results = run_model(
+    CP=CP,
+    use_EC=use_EC,
+    theta_mode=theta_mode_internal,
+    voting_rule=voting_rule,
+    force_lambda_one=force_lambda_one,
+)
+
+# best-effort display override if model doesn't support it internally
+if force_lambda_one and ("lambda" in results):
+    results["lambda"] = np.ones_like(np.asarray(results["lambda"]), dtype=float)
 I = np.asarray(results["I"])
 I_star = np.asarray(results["I_star"])
 Id_agg = np.asarray(results["Id_agg"])
@@ -516,3 +562,4 @@ st.download_button(
     file_name=csv_name,
     mime="text/csv",
 )
+
