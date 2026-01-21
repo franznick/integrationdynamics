@@ -1,4 +1,4 @@
-# app.py
+# app_integration_model.py
 # Streamlit app
 # v2.01: version label + lambda regime toggle + right plot shows Id_agg + pivotal country demand
 
@@ -63,6 +63,51 @@ def build_CP_matrix(
                 CP[idxs, t] = float(shock_level)
 
     return CP
+
+
+def run_model(CP, use_EC, theta_mode, voting_rule, force_lambda_one):
+    """
+    Robust wrapper to support different versions of integration_model_EU27_xres_final.run_simulation.
+    Tries multiple signatures (keyword + positional), with and without force_lambda_one.
+    """
+    # 1) Keyword-style signature (your older Streamlit-style model)
+    try:
+        return model.run_simulation(
+            CP=CP,
+            use_EC=use_EC,
+            theta_mode=theta_mode,
+            voting_rule=voting_rule,
+            force_lambda_one=force_lambda_one,
+        )
+    except TypeError:
+        pass
+
+    # 2) Keyword-style without force_lambda_one
+    try:
+        return model.run_simulation(
+            CP=CP,
+            use_EC=use_EC,
+            theta_mode=theta_mode,
+            voting_rule=voting_rule,
+        )
+    except TypeError:
+        pass
+
+    # 3) Positional-CP signature, with force_lambda_one
+    try:
+        return model.run_simulation(
+            CP,
+            voting_rule=voting_rule,
+            force_lambda_one=force_lambda_one,
+        )
+    except TypeError:
+        pass
+
+    # 4) Positional-CP signature, without force_lambda_one
+    return model.run_simulation(
+        CP,
+        voting_rule=voting_rule,
+    )
 
 
 # --------------------------
@@ -289,62 +334,8 @@ CP = build_CP_matrix(
 )
 
 # ===============================================================
-# RUN SIMULATION (unchanged, except optional force_lambda_one)
+# RUN SIMULATION (robust)
 # ===============================================================
-
-try:
-    results = model.run_simulation(
-        CP=CP,
-        use_EC=use_EC,
-        theta_mode=theta_mode_internal,
-        voting_rule=voting_rule,
-        force_lambda_one=force_lambda_one,
-    )
-except TypeError:
-  # ===============================================================
-# RUN SIMULATION (robust to different model signatures)
-# ===============================================================
-
-def run_model(CP, use_EC, theta_mode, voting_rule, force_lambda_one):
-    # 1) Keyword-style signature (your old Streamlit-style model)
-    try:
-        return model.run_simulation(
-            CP=CP,
-            use_EC=use_EC,
-            theta_mode=theta_mode,
-            voting_rule=voting_rule,
-            force_lambda_one=force_lambda_one,
-        )
-    except TypeError:
-        pass
-
-    # 2) Same, without force_lambda_one
-    try:
-        return model.run_simulation(
-            CP=CP,
-            use_EC=use_EC,
-            theta_mode=theta_mode,
-            voting_rule=voting_rule,
-        )
-    except TypeError:
-        pass
-
-    # 3) Positional-CP signature (some versions use run_simulation(CP, voting_rule=...))
-    try:
-        return model.run_simulation(
-            CP,
-            voting_rule=voting_rule,
-            force_lambda_one=force_lambda_one,
-        )
-    except TypeError:
-        pass
-
-    # 4) Positional-CP without force_lambda_one
-    return model.run_simulation(
-        CP,
-        voting_rule=voting_rule,
-    )
-
 
 results = run_model(
     CP=CP,
@@ -357,6 +348,7 @@ results = run_model(
 # best-effort display override if model doesn't support it internally
 if force_lambda_one and ("lambda" in results):
     results["lambda"] = np.ones_like(np.asarray(results["lambda"]), dtype=float)
+
 I = np.asarray(results["I"])
 I_star = np.asarray(results["I_star"])
 Id_agg = np.asarray(results["Id_agg"])
@@ -562,4 +554,3 @@ st.download_button(
     file_name=csv_name,
     mime="text/csv",
 )
-
