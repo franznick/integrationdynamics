@@ -1,4 +1,4 @@
-# app_integration_model.py
+# app_integration_model_app.py
 # Shiny for Python app
 # v2.01: version label + lambda regime toggle + right plot shows Id_agg + pivotal country demand
 
@@ -663,3 +663,4 @@ def server(input, output, session):
 
 
 app = App(app_ui, server)
+
