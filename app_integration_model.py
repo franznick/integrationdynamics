@@ -1,488 +1,665 @@
+# app_integration_model.py
+# Shiny for Python app
+# v2.01: version label + lambda regime toggle + right plot shows Id_agg + pivotal country demand
+
+from shiny import App, ui, render, reactive
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import streamlit as st
 
 import integration_model_EU27_xres_final as model
 
+APP_VERSION = "v2.01"
+
+
 # --------------------------
-# BASIC CONSTANT REFERENCES (will be overwritten by user choices)
+# Helpers
 # --------------------------
 
-C_default = model.C
-T_default = model.T
-DF_ALL = pd.DataFrame(model.COUNTRY_DATA)
+def safe_model_version():
+    return getattr(model, "MODEL_VERSION", "UNKNOWN")
 
-st.set_page_config(page_title="EU Integration Dynamics Simulator", layout="wide")
 
-st.title("EU Integration Dynamics Simulator")
-
-st.markdown(
+def compute_pivotal_series_optionB(Id_c_t: np.ndarray) -> tuple[int, float]:
     """
-Interactive playground for the EU integration dynamics model.
+    Sign-consensus pivotal logic (Option B) on current country demand vector Id_c(t):
+      - if all Id >= 0: pivot is argmin(Id) (most reluctant among supporters)
+      - if all Id <= 0: pivot is argmax(Id) (least negative among blockers)
+      - else (mixed signs): status quo; show strongest blocker = argmin(Id) (most negative)
+    Returns (pivot_index, pivot_id_value)
+    """
+    if np.all(Id_c_t >= 0):
+        idx = int(np.argmin(Id_c_t))
+        return idx, float(Id_c_t[idx])
+    if np.all(Id_c_t <= 0):
+        idx = int(np.argmax(Id_c_t))
+        return idx, float(Id_c_t[idx])
 
-Use the sidebar to:
-1. Choose **horizon T** and which **countries** are in the simulation.
-2. Specify whether the crisis is **symmetric** or **asymmetric**.
-3. Tick which **countries** and **periods** are hit in an asymmetric crisis.
-4. Tune the structural parameters using the canonical notation.
-"""
+    idx = int(np.argmin(Id_c_t))
+    return idx, float(Id_c_t[idx])
+
+
+def build_CP_matrix(
+    scenario: str,
+    C: int,
+    T: int,
+    shock_level: float,
+    crisis_periods: list[int],
+    crisis_countries: list[str],
+    codes: list[str],
+) -> np.ndarray:
+    CP = np.zeros((C, T + 1), dtype=float)
+
+    if scenario == "Symmetric crisis":
+        for t in crisis_periods:
+            if 0 <= t <= T:
+                CP[:, t] = float(shock_level)
+
+    elif scenario == "Asymmetric crisis":
+        code_to_idx = {c: i for i, c in enumerate(codes)}
+        idxs = [code_to_idx[c] for c in crisis_countries if c in code_to_idx]
+        for t in crisis_periods:
+            if 0 <= t <= T:
+                CP[idxs, t] = float(shock_level)
+
+    return CP
+
+
+# --------------------------
+# UI
+# --------------------------
+
+app_ui = ui.page_fluid(
+    ui.h2("EU Integration Dynamics Simulator"),
+    ui.tags.div(
+        ui.output_text("version_text"),
+        style="margin-bottom: 10px; font-size: 14px;",
+    ),
+
+    ui.layout_sidebar(
+        ui.sidebar(
+            ui.h4("Controls"),
+
+            # ===============================================================
+            # SIMULATION SCOPE
+            # ===============================================================
+            ui.h5("Simulation scope"),
+            ui.input_slider(
+                "sim_T",
+                "Number of periods T",
+                min=5,
+                max=100,
+                value=int(getattr(model, "T", 30)),
+                step=1,
+            ),
+
+            ui.input_selectize(
+                "country_selection",
+                "Countries included in simulation",
+                choices=[d["Code"] for d in model.COUNTRY_DATA],
+                selected=[d["Code"] for d in model.COUNTRY_DATA],
+                multiple=True,
+            ),
+
+            ui.hr(),
+
+            # ===============================================================
+            # CRISIS SETTINGS
+            # ===============================================================
+            ui.h5("Crisis settings"),
+            ui.input_select(
+                "scenario",
+                "Crisis pattern",
+                choices={
+                    "No crisis": "No crisis",
+                    "Symmetric crisis": "Symmetric crisis",
+                    "Asymmetric crisis": "Asymmetric crisis",
+                },
+                selected="No crisis",
+            ),
+            ui.input_slider(
+                "shock_level",
+                "Shock intensity during crisis periods (CP level)",
+                min=0.0,
+                max=0.50,
+                value=0.15,
+                step=0.01,
+            ),
+            ui.input_selectize(
+                "crisis_periods",
+                "Crisis periods (select values of t with CP > 0)",
+                choices=[],          # filled reactively once T known
+                selected=[],
+                multiple=True,
+            ),
+            ui.input_selectize(
+                "crisis_countries",
+                "Countries hit by the asymmetric crisis",
+                choices=[d["Code"] for d in model.COUNTRY_DATA],
+                selected=[c for c in ["IT", "ES", "EL"] if c in [d["Code"] for d in model.COUNTRY_DATA]][:3],
+                multiple=True,
+            ),
+
+            ui.hr(),
+
+            # ===============================================================
+            # POLITICAL SETTINGS (including NEW λ regime toggle)
+            # ===============================================================
+            ui.h5("Political settings"),
+            ui.input_select(
+                "theta_mode_label",
+                "θ regime (performance-gap coefficient)",
+                choices={"fixed": "fixed", "endogenous": "endogenous (1 - CP)"},
+                selected="fixed",
+            ),
+            ui.input_select(
+                "voting_rule",
+                "Voting rule for aggregation of demands",
+                choices={"majority": "majority", "unanimity": "unanimity"},
+                selected="unanimity",
+            ),
+            ui.input_checkbox(
+                "use_EC",
+                "Allow endogenous integration capacity (EC)",
+                value=True,
+            ),
+
+            # --- CHANGE (2): lambda regime toggle ---
+            ui.input_select(
+                "lambda_regime",
+                "λ regime",
+                choices={
+                    "endogenous": "Endogenous λ (default)",
+                    "one": "Force λ = 1",
+                },
+                selected="endogenous",
+            ),
+
+            ui.hr(),
+
+            # ===============================================================
+            # MODEL PARAMETERS (canonical notation)
+            # ===============================================================
+            ui.accordion(
+                ui.accordion_panel(
+                    "Model parameters (canonical notation)",
+                    ui.h6("Sovereignty / Political"),
+                    ui.input_slider("p", "p (overall policy sovereignty quotient)", 0.0, 1.0, float(getattr(model, "p", 0.5)), 0.01),
+                    ui.input_slider("pD", "p_d (policy sovereignty of democratic policies)", 0.0, 1.0, float(getattr(model, "pD", 0.5)), 0.01),
+                    ui.input_slider("D_level", "D (level of democratic control)", 0.0, 1.0, float(getattr(model, "D_level", 0.5)), 0.01),
+                    ui.input_slider("alpha_p0", "α_p0 (baseline sovereignty coefficient)", 0.0, 2.0, float(getattr(model, "alpha_p0", 1.0)), 0.05),
+                    ui.input_slider("gamma_alpha", "γ_α (mobilisation elasticity of sovereignty)", 0.0, 1.0, float(getattr(model, "gamma_alpha", 0.5)), 0.01),
+                    ui.input_slider("alpha_D", "α_D (relevance of democratic control on sovereignty)", 0.0, 2.0, float(getattr(model, "alpha_D", 1.0)), 0.05),
+
+                    ui.hr(),
+                    ui.h6("Interdependence"),
+                    ui.input_slider("ie", "Ie (ecological interdependence)", 0.0, 1.0, float(getattr(model, "ie", 0.1)), 0.01),
+                    ui.input_slider("is_", "Is (strategic interdependence)", 0.0, 1.0, float(getattr(model, "is_", 0.1)), 0.01),
+                    ui.input_slider("ip", "Ip (policy interdependence)", 0.0, 1.0, float(getattr(model, "ip", 0.1)), 0.01),
+
+                    ui.hr(),
+                    ui.h6("Identity / Legitimacy"),
+                    ui.input_slider("beta_A", "β_A (output legitimacy coefficient)", 0.0, 2.0, float(getattr(model, "beta_A", 1.0)), 0.05),
+                    ui.input_slider("betaE0", "β_e (baseline mobilisation coefficient)", 0.0, 2.0, float(getattr(model, "betaE0", 1.0)), 0.05),
+                    ui.input_slider("eta_A", "η_A (output legitimacy coefficient of identity)", 0.0, 1.0, float(getattr(model, "eta_A", 0.5)), 0.01),
+                    ui.input_slider("eta_S", "η_S (shared experience coefficient of identity)", 0.0, 1.0, float(getattr(model, "eta_S", 0.5)), 0.01),
+
+                    ui.hr(),
+                    ui.h6("Endogenous mobilisation"),
+                    ui.input_slider("kappa_long", "k_long (long-term mobilisation coefficient)", 0.0, 2.0, float(getattr(model, "kappa_long", 1.0)), 0.05),
+                    ui.input_slider("kappa_short", "k_short (short-term mobilisation coefficient)", 0.0, 2.0, float(getattr(model, "kappa_short", 1.0)), 0.05),
+
+                    ui.hr(),
+                    ui.h6("Crisis & integration pressure weights"),
+                    ui.input_slider("alpha_cp", "α_IP (crisis → integration pressure weight)", 0.0, 2.0, float(getattr(model, "alpha_cp", 1.0)), 0.05),
+                    ui.input_slider("alpha_pf", "ω (propagation / spillover weight)", 0.0, 2.0, float(getattr(model, "alpha_pf", 1.0)), 0.05),
+
+                    ui.hr(),
+                    ui.h6("Crisis response capacity"),
+                    ui.input_slider("gamma_crc", "γ_CRC (counter-crisis elasticity)", 0.0, 2.0, float(getattr(model, "gamma_crc", 1.0)), 0.05),
+                    ui.input_slider("x_res", "x (EU-level crisis resolution capacity)", 0.0, 1.0, float(getattr(model, "x_res", 0.5)), 0.01),
+
+                    ui.hr(),
+                    ui.h6("Cohesion / performance gap"),
+                    ui.input_slider("theta_fixed", "θ (performance-gap coefficient)", 0.0, 1.0, float(getattr(model, "theta_fixed", 0.5)), 0.01),
+                ),
+                open=False,
+            ),
+
+            ui.hr(),
+
+            # ===============================================================
+            # HORIZON DISPLAY
+            # ===============================================================
+            ui.h5("Display"),
+            ui.input_slider(
+                "horizon_display",
+                "Horizon to display (last period t)",
+                min=1,
+                max=int(getattr(model, "T", 30)),
+                value=int(getattr(model, "T", 30)),
+                step=1,
+            ),
+
+            width=360,
+        ),
+
+        # ===============================================================
+        # MAIN PANEL
+        # ===============================================================
+        ui.layout_columns(
+            ui.card(
+                ui.card_header("Integration level I(t) and functional target I*(t)"),
+                ui.output_plot("plot_left"),
+                full_screen=True,
+            ),
+            ui.card(
+                # --- CHANGE (3): right plot title matches Id_agg + pivotal Id ---
+                ui.card_header("Aggregate demand Id_agg(t) and pivotal/constraint country demand"),
+                ui.output_plot("plot_right"),
+                full_screen=True,
+            ),
+            col_widths=[6, 6],
+        ),
+
+        ui.hr(),
+
+        ui.layout_columns(
+            ui.card(
+                ui.card_header("Crisis pressure CP(t) for a few countries"),
+                ui.output_plot("plot_cp"),
+                full_screen=True,
+            ),
+            ui.card(
+                ui.card_header("Per-country components (IP, SP, PF, CRC)"),
+                ui.input_select(
+                    "component_select",
+                    "Component to show",
+                    choices={
+                        "IP": "IP (integration pressure)",
+                        "SP": "SP (status-quo pressure)",
+                        "PF": "PF (spillover pressure)",
+                        "CRC": "CRC (counter-crisis capacity)",
+                    },
+                    selected="IP",
+                ),
+                ui.input_selectize(
+                    "component_countries",
+                    "Countries to display",
+                    choices=[d["Code"] for d in model.COUNTRY_DATA],
+                    selected=[c for c in ["DE", "FR", "IT"] if c in [d["Code"] for d in model.COUNTRY_DATA]],
+                    multiple=True,
+                ),
+                ui.output_plot("plot_components"),
+                full_screen=True,
+            ),
+            col_widths=[6, 6],
+        ),
+
+        ui.hr(),
+
+        ui.h4("Simulation data (first 15 periods of selected horizon)"),
+        ui.output_data_frame("table_summary"),
+
+        ui.h4("Download results as CSV"),
+        ui.input_text("scenario_label", "Scenario label (for filename)", value="scenario"),
+        ui.download_button("download_csv", "Download current horizon results as CSV"),
+    ),
 )
 
-# ===============================================================
-# SIDEBAR: SIMULATION SCOPE (T and country set)
-# ===============================================================
-
-st.sidebar.header("Simulation scope")
-
-# 1) Horizon T (periods)
-sim_T = st.sidebar.slider(
-    "Number of periods T",
-    min_value=5,
-    max_value=100,
-    value=T_default,
-    step=1,
-    key="sim_T",
-)
-
-# Update model horizon
-model.T = sim_T
-T = sim_T
-
-# 2) Country selection
-country_options = DF_ALL["Code"].tolist()
-selected_countries = st.sidebar.multiselect(
-    "Countries included in simulation",
-    options=country_options,
-    default=country_options,
-    key="country_selection",
-)
-
-if not selected_countries:
-    st.sidebar.warning("Select at least one country; reverting to all 27.")
-    selected_countries = country_options
-
-df_countries = DF_ALL[DF_ALL["Code"].isin(selected_countries)].reset_index(drop=True)
-
-# Update model country set
-model.COUNTRY_DATA = df_countries.to_dict("records")
-model.C = len(df_countries)
-C = model.C
-
-# Recompute weights with the active set
-omega_econ, omega_pol, omega_f, w = model.set_weights_from_df(df_countries)
-
-# ===============================================================
-# SIDEBAR: CRISIS SETTINGS
-# ===============================================================
-
-st.sidebar.header("Crisis settings")
-
-scenario = st.sidebar.selectbox(
-    "Crisis pattern",
-    [
-        "No crisis",
-        "Symmetric crisis",
-        "Asymmetric crisis",
-    ],
-    key="scenario",
-)
-
-shock_level = st.sidebar.slider(
-    "Shock intensity during crisis periods (CP level)",
-    min_value=0.0,
-    max_value=0.50,
-    value=0.15,
-    step=0.01,
-    key="shock_level",
-)
-
-# 3) Crisis periods: tick individual periods
-if scenario != "No crisis":
-    period_options = list(range(1, T + 1))
-    default_periods = [t for t in [4, 5, 6] if t <= T] or period_options[:min(3, len(period_options))]
-    crisis_periods = st.sidebar.multiselect(
-        "Crisis periods (select values of t with CP > 0)",
-        options=period_options,
-        default=default_periods,
-        key="crisis_periods",
-    )
-else:
-    crisis_periods = []
-
-# 4) Crisis countries (for asymmetric scenario)
-if scenario == "Asymmetric crisis":
-    crisis_country_options = df_countries["Code"].tolist()
-    default_crisis_countries = [c for c in ["IT", "ES", "EL"] if c in crisis_country_options] \
-                               or crisis_country_options[:min(3, len(crisis_country_options))]
-    crisis_countries = st.sidebar.multiselect(
-        "Countries hit by the asymmetric crisis",
-        options=crisis_country_options,
-        default=default_crisis_countries,
-        key="crisis_countries",
-    )
-    if not crisis_countries:
-        st.sidebar.warning("Select at least one country to be hit; reverting to default.")
-        crisis_countries = default_crisis_countries
-else:
-    crisis_countries = []
 
-# ===============================================================
-# SIDEBAR: POLITICAL SETTINGS (θ regime)
-# ===============================================================
-
-st.sidebar.header("Political settings")
-
-theta_mode_label = st.sidebar.selectbox(
-    "θ regime (performance-gap coefficient)",
-    ["fixed", "endogenous (1 - CP)"],
-)
-
-voting_rule = st.sidebar.selectbox(
-    "Voting rule for aggregation of demands",
-    ["majority", "unanimity"],
-)
-
-use_EC = st.sidebar.checkbox(
-    "Allow endogenous integration capacity (EC)",
-    value=True,
-)
-
-theta_mode_internal = "fixed" if theta_mode_label == "fixed" else "endogenous"
-
-st.sidebar.markdown("---")
-
-# ===============================================================
-# SIDEBAR: MODEL PARAMETERS (CANONICAL NOTATION)
-# ===============================================================
-
-with st.sidebar.expander("Model parameters (canonical notation)", expanded=False):
-
-    # --- Sovereignty / Political ---
-
-    p = st.slider("p  (overall policy sovereignty quotient)",
-                  0.0, 1.0, float(model.p), 0.01)
-
-    pD = st.slider("p_d  (policy sovereignty of democratic policies)",
-                   0.0, 1.0, float(model.pD), 0.01)
-
-    D_level = st.slider("D  (level of democratic control)",
-                        0.0, 1.0, float(model.D_level), 0.01)
-
-    alpha_p0 = st.slider("α_p0  (baseline sovereignty coefficient)",
-                         0.0, 2.0, float(model.alpha_p0), 0.05)
-
-    gamma_alpha = st.slider("γ_α  (mobilisation elasticity of sovereignty)",
-                            0.0, 1.0, float(model.gamma_alpha), 0.01)
-
-    alpha_D = st.slider("α_D  (relevance of democratic control on sovereignty)",
-                        0.0, 2.0, float(model.alpha_D), 0.05)
-
-
-    # --- Interdependence ---
-
-    ie = st.slider("Ie  (ecological interdependence)",
-                   0.0, 1.0, float(model.ie), 0.01)
-
-    is_ = st.slider("Is  (strategic interdependence)",
-                    0.0, 1.0, float(model.is_), 0.01)
-
-    ip = st.slider("Ip  (policy interdependence)",
-                   0.0, 1.0, float(model.ip), 0.01)
-
-
-    # --- Identity / Legitimacy ---
-
-    beta_A = st.slider("β_A  (output legitimacy coefficient)",
-                       0.0, 2.0, float(model.beta_A), 0.05)
-
-    betaE0 = st.slider("β_e  (baseline mobilisation coefficient)",
-                       0.0, 2.0, float(model.betaE0), 0.05)
-
-    eta_A = st.slider("η_A  (output legitimacy coefficient of identity)",
-                      0.0, 1.0, float(model.eta_A), 0.01)
-
-    eta_S = st.slider("η_S  (shared experience coefficient of identity)",
-                      0.0, 1.0, float(model.eta_S), 0.01)
-
-
-    # --- Endogenous mobilisation ---
-
-    kappa_long = st.slider("k_long  (long-term mobilisation coefficient)",
-                           0.0, 2.0, float(model.kappa_long), 0.05)
-
-    kappa_short = st.slider("k_short  (short-term mobilisation coefficient)",
-                            0.0, 2.0, float(model.kappa_short), 0.05)
-
-
-    # --- Crisis & integration pressure weights ---
-
-    alpha_cp = st.slider("α_IP  (crisis → integration pressure weight)",
-                         0.0, 2.0, float(model.alpha_cp), 0.05)
-
-    alpha_pf = st.slider("ω  (propagation / spillover weight)",
-                         0.0, 2.0, float(model.alpha_pf), 0.05)
-
-
-    # --- Crisis response capacity ---
-
-    gamma_crc = st.slider("γ_CRC  (counter-crisis elasticity)",
-                          0.0, 2.0, float(model.gamma_crc), 0.05)
-
-    x_res = st.slider("x  (EU-level crisis resolution capacity)",
-                      0.0, 1.0, float(model.x_res), 0.01)
-
-
-    # --- Cohesion / performance gap ---
-
-    theta_fixed = st.slider("θ  (performance-gap coefficient)",
-                            0.0, 1.0, float(model.theta_fixed), 0.01)
-
-
-# Update model globals with canonical parameters
-model.p = p
-model.pD = pD if pD <= p else p
-model.D_level = D_level
-model.alpha_p0 = alpha_p0
-model.gamma_alpha = gamma_alpha
-model.alpha_D = alpha_D
-model.ie = ie
-model.is_ = is_
-model.ip = ip
-model.beta_A = beta_A
-model.betaE0 = betaE0
-model.eta_A = eta_A
-model.eta_S = eta_S
-model.kappa_long = kappa_long
-model.kappa_short = kappa_short
-model.alpha_cp = alpha_cp
-model.alpha_pf = alpha_pf
-model.gamma_crc = gamma_crc
-model.x_res = x_res
-model.theta_fixed = theta_fixed
-
-# recompute K as in your original script (Ie, Is, Ip)
-model.K = (model.ie + model.is_ + model.ip) / 3.0
-
-st.sidebar.markdown("---")
-
-# ===============================================================
-# BUILD CRISIS PRESSURE MATRIX CP
-# ===============================================================
-
-CP = np.zeros((C, T + 1))
-
-if scenario == "Symmetric crisis":
-    for t in crisis_periods:
-        if 0 <= t <= T:
-            CP[:, t] = shock_level
-
-elif scenario == "Asymmetric crisis":
-    code_to_idx = {code: i for i, code in enumerate(df_countries["Code"].tolist())}
-    crisis_idx = [code_to_idx[c] for c in crisis_countries if c in code_to_idx]
-    for t in crisis_periods:
-        if 0 <= t <= T:
-            CP[crisis_idx, t] = shock_level
-
-# (No crisis scenario leaves CP as zeros)
-
-# ===============================================================
-# RUN SIMULATION
-# ===============================================================
-
-results = model.run_simulation(
-    CP=CP,
-    use_EC=use_EC,
-    theta_mode=theta_mode_internal,
-    voting_rule=voting_rule,
-)
-
-I = results["I"]
-I_star = results["I_star"]
-Id_agg = results["Id_agg"]
-lambda_t = results["lambda"]
-
-CRC = results.get("CRC", None)
-IP_c = results.get("IP", None)
-SP_c = results.get("SP", None)
-PF_c = results.get("PF", None)
-CP_out = results.get("CP", CP)
-
-# ===============================================================
-# HORIZON SLIDER (DISPLAYED T)
-# ===============================================================
-
-max_h = len(I) - 1
-H = st.sidebar.slider(
-    "Horizon to display (last period t)",
-    min_value=1,
-    max_value=max_h,
-    value=max_h,
-    key="horizon_display",
-)
-idx = np.arange(H + 1)
-time = idx
-
-I_plot = I[idx]
-I_star_plot = I_star[idx]
-Id_agg_plot = Id_agg[idx]
-lambda_plot = lambda_t[idx]
-
-# ===============================================================
-# MAIN PLOTS
-# ===============================================================
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Integration level I(t) and functional target I*(t)")
-    fig, ax = plt.subplots()
-    ax.plot(time, I_plot, label="I(t) – actual integration")
-    ax.plot(time, I_star_plot, linestyle="--", label="I*(t) – functional target")
-    ax.set_xlabel("Time (t)")
-    ax.set_ylabel("Integration level")
-    ax.set_ylim(0.0, 1.0)
-    ax.grid(True, linestyle=":", linewidth=0.5)
-    ax.legend()
-    st.pyplot(fig)
-
-with col2:
-    st.subheader("Aggregate demand Id_agg(t) and political capacity λ(t)")
-    fig2, ax2 = plt.subplots()
-    ax2.plot(time, Id_agg_plot, label="Id_agg(t)")
-    ax2.axhline(0.0, linestyle=":", linewidth=0.8)
-    ax2.set_xlabel("Time (t)")
-    ax2.set_ylabel("Aggregate demand Id_agg")
-    ax2.grid(True, linestyle=":", linewidth=0.5)
-
-    ax3 = ax2.twinx()
-    ax3.plot(time, lambda_plot, linestyle="--", label="λ(t)")
-    ax3.set_ylabel("Political capacity λ(t)")
-
-    lines1, labels1 = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax3.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
-
-    st.pyplot(fig2)
-
-# ===============================================================
-# OPTIONAL: CRISIS PATTERN VIEW
-# ===============================================================
-
-with st.expander("Show crisis pressure CP(t) for a few countries"):
-    n_show = min(5, C)
-    sample_df = df_countries.head(n_show).copy()
-    idxs_c = sample_df.index.to_list()
-    cp_subset = CP_out[idxs_c, :][:, idx]
-
-    fig3, ax4 = plt.subplots()
-    for i_c, idx_c in enumerate(idxs_c):
-        ax4.plot(time, cp_subset[i_c, :], label=sample_df.loc[idx_c, "Code"])
-    ax4.set_xlabel("Time (t)")
-    ax4.set_ylabel("Crisis pressure CP")
-    ax4.grid(True, linestyle=":", linewidth=0.5)
-    ax4.legend()
-    st.pyplot(fig3)
-
-# ===============================================================
-# PER-COUNTRY COMPONENTS
-# ===============================================================
-
-with st.expander("Per-country components (IP, SP, PF, CRC)"):
-    component = st.selectbox(
-        "Component to show",
-        [
-            "IP (integration pressure)",
-            "SP (status-quo pressure)",
-            "PF (spillover pressure)",
-            "CRC (counter-crisis capacity)",
-        ],
-        key="component_select",
-    )
-
-    codes_all = df_countries["Code"].tolist()
-    default_selection = [c for c in ["DE", "FR", "IT"] if c in codes_all]
-    selected_codes = st.multiselect(
-        "Countries to display",
-        options=codes_all,
-        default=default_selection if default_selection else codes_all[:3],
-        key="component_countries",
-    )
-
-    comp_map = {
-        "IP (integration pressure)": IP_c,
-        "SP (status-quo pressure)": SP_c,
-        "PF (spillover pressure)": PF_c,
-        "CRC (counter-crisis capacity)": CRC,
-    }
-    data = comp_map.get(component, None)
-
-    if data is None:
-        st.info("Selected component is not available in the results.")
-    else:
-        figc, axc = plt.subplots()
+# --------------------------
+# Server
+# --------------------------
+
+def server(input, output, session):
+
+    # --- CHANGE (1): version label shown in UI ---
+    @output
+    @render.text
+    def version_text():
+        return f"App version: {APP_VERSION} | Model version: {safe_model_version()}"
+
+    # Keep crisis period choices synced with T
+    @reactive.effect
+    def _update_crisis_period_choices():
+        T = int(input.sim_T())
+        choices = list(range(1, T + 1))
+        default = [t for t in [4, 5, 6] if t <= T] or choices[: min(3, len(choices))]
+        ui.update_selectize(
+            "crisis_periods",
+            choices=choices,
+            selected=default if input.scenario() != "No crisis" else [],
+        )
+        ui.update_slider("horizon_display", max=T, value=min(int(input.horizon_display()), T))
+        ui.update_slider("t_start", max=T, value=min(int(input.t_start()), T)) if "t_start" in input else None
+
+    @reactive.calc
+    def simulation_bundle():
+        # 1) Horizon T
+        sim_T = int(input.sim_T())
+        model.T = sim_T
+        T = sim_T
+
+        # 2) Country selection
+        DF_ALL = pd.DataFrame(model.COUNTRY_DATA)
+        all_codes = DF_ALL["Code"].tolist()
+        selected = list(input.country_selection() or [])
+
+        if not selected:
+            selected = all_codes
+
+        df_countries = DF_ALL[DF_ALL["Code"].isin(selected)].reset_index(drop=True)
+
+        # Update model country set
+        model.COUNTRY_DATA = df_countries.to_dict("records")
+        model.C = len(df_countries)
+        C = model.C
+
+        # Recompute weights (if available)
+        if hasattr(model, "set_weights_from_df"):
+            try:
+                model.set_weights_from_df(df_countries)
+            except Exception:
+                pass
+
+        # 3) Political settings
+        theta_mode_internal = "fixed" if input.theta_mode_label() == "fixed" else "endogenous"
+        voting_rule = input.voting_rule()
+        use_EC = bool(input.use_EC())
+
+        # --- CHANGE (2): lambda regime toggle (force λ = 1) ---
+        force_lambda_one = (input.lambda_regime() == "one")
+
+        # 4) Canonical parameters
+        model.p = float(input.p())
+        model.pD = min(float(input.pD()), model.p)
+        model.D_level = float(input.D_level())
+        model.alpha_p0 = float(input.alpha_p0())
+        model.gamma_alpha = float(input.gamma_alpha())
+        model.alpha_D = float(input.alpha_D())
+
+        model.ie = float(input.ie())
+        model.is_ = float(input.is_())
+        model.ip = float(input.ip())
+
+        model.beta_A = float(input.beta_A())
+        model.betaE0 = float(input.betaE0())
+        model.eta_A = float(input.eta_A())
+        model.eta_S = float(input.eta_S())
+
+        model.kappa_long = float(input.kappa_long())
+        model.kappa_short = float(input.kappa_short())
+
+        model.alpha_cp = float(input.alpha_cp())
+        model.alpha_pf = float(input.alpha_pf())
+
+        model.gamma_crc = float(input.gamma_crc())
+        model.x_res = float(input.x_res())
+
+        model.theta_fixed = float(input.theta_fixed())
+
+        # recompute K
+        model.K = (model.ie + model.is_ + model.ip) / 3.0
+
+        # 5) Crisis
+        scenario = input.scenario()
+        shock_level = float(input.shock_level())
+
+        crisis_periods = list(input.crisis_periods() or []) if scenario != "No crisis" else []
+        crisis_countries = list(input.crisis_countries() or []) if scenario == "Asymmetric crisis" else []
+
+        codes = df_countries["Code"].tolist()
+
+        CP = build_CP_matrix(
+            scenario=scenario,
+            C=C,
+            T=T,
+            shock_level=shock_level,
+            crisis_periods=[int(x) for x in crisis_periods],
+            crisis_countries=crisis_countries,
+            codes=codes,
+        )
+
+        # 6) Run simulation, preserving old signature first
+        try:
+            res = model.run_simulation(
+                CP=CP,
+                use_EC=use_EC,
+                theta_mode=theta_mode_internal,
+                voting_rule=voting_rule,
+                force_lambda_one=force_lambda_one,   # model may or may not accept
+            )
+        except TypeError:
+            res = model.run_simulation(
+                CP=CP,
+                use_EC=use_EC,
+                theta_mode=theta_mode_internal,
+                voting_rule=voting_rule,
+            )
+            # If model cannot enforce λ=1 internally, do a best-effort display override
+            if force_lambda_one and ("lambda" in res):
+                lam = np.asarray(res["lambda"])
+                res["lambda"] = np.ones_like(lam, dtype=float)
+
+        return {
+            "res": res,
+            "CP": CP,
+            "df_countries": df_countries,
+            "codes": codes,
+            "C": C,
+            "T": T,
+        }
+
+    def _get_horizon_series():
+        bundle = simulation_bundle()
+        res = bundle["res"]
+
+        I = np.asarray(res.get("I"))
+        I_star = np.asarray(res.get("I_star"))
+        Id_agg = np.asarray(res.get("Id_agg"))
+        lam = np.asarray(res.get("lambda")) if res.get("lambda") is not None else None
+
+        H = int(input.horizon_display())
+        max_h = len(I) - 1
+        H = max(1, min(H, max_h))
+
+        idx = np.arange(H + 1)
+
+        out = {
+            "idx": idx,
+            "t": idx,
+            "I": I[idx],
+            "I_star": I_star[idx] if I_star is not None and len(I_star) >= (H + 1) else None,
+            "Id_agg": Id_agg[idx] if Id_agg is not None and len(Id_agg) >= (H + 1) else None,
+            "lambda": lam[idx] if lam is not None and len(lam) >= (H + 1) else None,
+        }
+        return out
+
+    @output
+    @render.plot
+    def plot_left():
+        series = _get_horizon_series()
+        t = series["t"]
+
+        plt.figure()
+        plt.plot(t, series["I"], label="I(t) – actual integration")
+        if series["I_star"] is not None:
+            plt.plot(t, series["I_star"], linestyle="--", label="I*(t) – functional target")
+        plt.xlabel("Time (t)")
+        plt.ylabel("Integration level")
+        plt.ylim(0.0, 1.0)
+        plt.grid(True, linestyle=":", linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+    @output
+    @render.plot
+    def plot_right():
+        # --- CHANGE (3): right plot shows Id_agg + pivotal country demand (with change markers) ---
+        bundle = simulation_bundle()
+        res = bundle["res"]
+        codes = bundle["codes"]
+
+        series = _get_horizon_series()
+        t = series["t"]
+        Id_agg = series["Id_agg"]
+        if Id_agg is None:
+            raise RuntimeError("Model output must include 'Id_agg'.")
+
+        IP = np.asarray(res.get("IP", None))
+        SP = np.asarray(res.get("SP", None))
+        if IP is None or SP is None or IP.ndim != 2 or SP.ndim != 2:
+            raise RuntimeError("Model output must include 2D arrays 'IP' and 'SP' to compute pivotal demand.")
+
+        Id_c = IP - SP  # per-country demand proxy (as in your new code)
+
+        # Align time length
+        Tplot = len(t)
+        if Id_c.shape[1] < Tplot:
+            Tplot = Id_c.shape[1]
+            t = t[:Tplot]
+            Id_agg = Id_agg[:Tplot]
+
+        piv_codes = []
+        Id_piv = np.zeros(Tplot, dtype=float)
+
+        for tt in range(Tplot):
+            idx, idv = compute_pivotal_series_optionB(Id_c[:, tt])
+            piv_codes.append(codes[idx])
+            Id_piv[tt] = idv
+
+        # change points
+        change = np.zeros(Tplot, dtype=bool)
+        change[0] = True
+        for tt in range(1, Tplot):
+            change[tt] = (piv_codes[tt] != piv_codes[tt - 1])
+
+        plt.figure()
+        plt.axhline(0.0, linestyle=":", linewidth=1)
+
+        plt.plot(t, Id_agg, label="Id_agg(t)")
+        plt.plot(t, Id_piv, linestyle="--", label="Id_piv(t) – pivotal/constraint country")
+
+        for tt in range(Tplot):
+            if change[tt]:
+                plt.axvline(t[tt], alpha=0.25)
+                y = Id_piv[tt]
+                plt.text(t[tt], y, f" {piv_codes[tt]}", fontsize=9, va="bottom")
+
+        plt.xlabel("Time (t)")
+        plt.ylabel("Demand")
+        plt.grid(True, linestyle=":", linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+    @output
+    @render.plot
+    def plot_cp():
+        bundle = simulation_bundle()
+        CP = np.asarray(bundle["CP"])
+        df_countries = bundle["df_countries"]
+        C = bundle["C"]
+
+        series = _get_horizon_series()
+        t = series["t"]
+        idx = series["idx"]
+
+        n_show = min(5, C)
+        sample_df = df_countries.head(n_show).copy()
+        idxs_c = sample_df.index.to_list()
+        cp_subset = CP[idxs_c, :][:, idx]
+
+        plt.figure()
+        for i_c, idx_c in enumerate(idxs_c):
+            plt.plot(t, cp_subset[i_c, :], label=sample_df.loc[idx_c, "Code"])
+        plt.xlabel("Time (t)")
+        plt.ylabel("Crisis pressure CP")
+        plt.grid(True, linestyle=":", linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+    @output
+    @render.plot
+    def plot_components():
+        bundle = simulation_bundle()
+        res = bundle["res"]
+        codes_all = bundle["codes"]
+
+        series = _get_horizon_series()
+        t = series["t"]
+        idx = series["idx"]
+
+        component_key = input.component_select()
+        comp_map = {
+            "IP": res.get("IP", None),
+            "SP": res.get("SP", None),
+            "PF": res.get("PF", None),
+            "CRC": res.get("CRC", None),
+        }
+        data = comp_map.get(component_key, None)
+
+        selected_codes = list(input.component_countries() or [])
+        if not selected_codes:
+            selected_codes = [c for c in ["DE", "FR", "IT"] if c in codes_all] or codes_all[:3]
+
+        plt.figure()
+        if data is None:
+            plt.text(0.1, 0.5, "Selected component is not available in the results.", transform=plt.gca().transAxes)
+            plt.axis("off")
+            return
+
+        data = np.asarray(data)
         for code in selected_codes:
             if code in codes_all:
                 idx_c = codes_all.index(code)
-                series = data[idx_c, :][idx]
-                axc.plot(time, series, label=code)
-        axc.set_xlabel("Time (t)")
-        axc.set_ylabel(component)
-        axc.grid(True, linestyle=":", linewidth=0.5)
-        axc.legend()
-        st.pyplot(figc)
+                series_c = data[idx_c, :][idx]
+                plt.plot(t, series_c, label=code)
 
-# ===============================================================
-# DATA TABLE & CSV EXPORT
-# ===============================================================
+        plt.xlabel("Time (t)")
+        plt.ylabel(component_key)
+        plt.grid(True, linestyle=":", linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
 
-st.subheader("Simulation data (first 15 periods of selected horizon)")
+    @output
+    @render.data_frame
+    def table_summary():
+        series = _get_horizon_series()
+        t = series["t"]
 
-summary_df = pd.DataFrame(
-    {
-        "t": time,
-        "I": I_plot,
-        "I_star": I_star_plot,
-        "Id_agg": Id_agg_plot,
-        "lambda": lambda_plot,
-    }
-)
+        df = pd.DataFrame(
+            {
+                "t": t,
+                "I": series["I"],
+                "I_star": series["I_star"] if series["I_star"] is not None else np.nan,
+                "Id_agg": series["Id_agg"] if series["Id_agg"] is not None else np.nan,
+                "lambda": series["lambda"] if series["lambda"] is not None else np.nan,
+            }
+        )
+        return render.DataGrid(df.head(15))
 
-st.dataframe(summary_df.head(15))
+    @output
+    @render.download(filename=lambda: None)
+    def download_csv():
+        series = _get_horizon_series()
+        t = series["t"]
 
-st.markdown("### Download results as CSV")
+        label = (input.scenario_label() or "scenario").replace(" ", "_")
+        H = int(input.horizon_display())
+        filename = f"results_{label}_T{H}.csv"
 
-scenario_label = st.text_input(
-    "Scenario label (for filename)",
-    value="scenario",
-    key="scenario_label",
-)
+        df = pd.DataFrame(
+            {
+                "t": t,
+                "I": series["I"],
+                "I_star": series["I_star"] if series["I_star"] is not None else np.nan,
+                "Id_agg": series["Id_agg"] if series["Id_agg"] is not None else np.nan,
+                "lambda": series["lambda"] if series["lambda"] is not None else np.nan,
+            }
+        )
 
-full_df = pd.DataFrame(
-    {
-        "t": time,
-        "I": I_plot,
-        "I_star": I_star_plot,
-        "Id_agg": Id_agg_plot,
-        "lambda": lambda_plot,
-    }
-)
+        yield df.to_csv(index=False).encode("utf-8")
 
-csv_bytes = full_df.to_csv(index=False).encode("utf-8")
-csv_name = f"results_{(scenario_label or 'scenario').replace(' ', '_')}_T{H}.csv"
 
-st.download_button(
-    label="Download current horizon results as CSV",
-    data=csv_bytes,
-    file_name=csv_name,
-    mime="text/csv",
-)
-
-st.markdown(
-    """
-To explore more:
-- Adjust the **T slider** and crisis periods to shape the scenario.
-- Restrict the simulation to a **subset of countries** in the scope panel.
-- Use the **per-country components** view to see how IP, SP, PF, and CRC evolve.
-"""
-)
+app = App(app_ui, server)
